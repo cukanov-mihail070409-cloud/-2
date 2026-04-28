@@ -1,0 +1,546 @@
+import asyncio
+import time
+import uuid
+import cv2
+import numpy as np
+from PIL import Image
+import mediapipe as mp
+import io
+import base64
+import hashlib
+import httpx
+import json
+import logging
+import redis
+import os
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ===================== LOGGING =====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("arbot")
+
+# ===================== CONFIG =====================
+
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_KEY", "YOUR_KEY")
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+NUM_WORKERS = 4
+MAX_RETRIES = 3
+JOB_TTL = 3600          # секунд, как долго хранить задание в Redis
+RATE_LIMIT_WINDOW = 60  # секунд
+RATE_LIMIT_MAX = 5      # запросов за окно
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# ===================== PRIVACY =====================
+
+def anon(uid: int) -> str:
+    return hashlib.sha256(str(uid).encode()).hexdigest()[:12]
+
+# ===================== RATE LIMITER =====================
+
+def check_rate_limit(user_id: int) -> bool:
+    """Возвращает True если лимит не превышен, False если превышен."""
+    key = f"rl:{user_id}:{int(time.time() // RATE_LIMIT_WINDOW)}"
+    count = rdb.incr(key)
+    if count == 1:
+        rdb.expire(key, RATE_LIMIT_WINDOW)
+    return count <= RATE_LIMIT_MAX
+
+# ===================== JOB SYSTEM =====================
+
+def create_job(job_type: str, chat_id: int, data: dict) -> str:
+    job_id = str(uuid.uuid4())
+    payload = {
+        "id": job_id,
+        "type": job_type,
+        "chat_id": chat_id,
+        "status": "pending",
+        "data": json.dumps(data),
+        "created": time.time(),
+        "retries": 0
+    }
+    rdb.lpush("jobs", json.dumps(payload))
+    rdb.setex(f"job:{job_id}", JOB_TTL, json.dumps(payload))
+    log.info(f"Job created: {job_id} type={job_type} user={anon(chat_id)}")
+    return job_id
+
+
+def update_job(job: dict) -> None:
+    rdb.setex(f"job:{job['id']}", JOB_TTL, json.dumps(job))
+
+
+def get_job(job_id: str) -> dict | None:
+    raw = rdb.get(f"job:{job_id}")
+    return json.loads(raw) if raw else None
+
+
+def mark_notified(job_id: str) -> None:
+    rdb.lpush("jobs:notified", job_id)
+    rdb.ltrim("jobs:notified", 0, 9999)
+
+# ===================== CPU POOL =====================
+
+async def run_cpu(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+# ===================== IMAGE CORE =====================
+
+def decode_bytes(img_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def decode_b64(b64_str: str) -> np.ndarray:
+    return decode_bytes(base64.b64decode(b64_str))
+
+
+def encode_jpg(image: np.ndarray) -> bytes:
+    _, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return buf.tobytes()
+
+
+def encode_png(image: np.ndarray) -> bytes:
+    _, buf = cv2.imencode(".png", image)
+    return buf.tobytes()
+
+# ===================== AI ENGINE =====================
+
+async def ai_generate(prompt: str) -> bytes:
+    async with httpx.AsyncClient(timeout=90) as c:
+        resp = await c.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            json={
+                "model": "gpt-image-1",
+                "prompt": prompt,
+                "size": "1024x1024"
+            }
+        )
+        resp.raise_for_status()
+        return base64.b64decode(resp.json()["data"][0]["b64_json"])
+
+
+async def ai_edit(img_bytes: bytes, prompt: str) -> bytes:
+    async with httpx.AsyncClient(timeout=90) as c:
+        resp = await c.post(
+            "https://api.openai.com/v1/images/edits",
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            files={"image": ("img.png", img_bytes, "image/png")},
+            data={"prompt": prompt, "model": "gpt-image-1"}
+        )
+        resp.raise_for_status()
+        return base64.b64decode(resp.json()["data"][0]["b64_json"])
+
+# ===================== FACE SWAP (HOOK READY) =====================
+
+def faceswap(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    # Заглушка — здесь подключается InsightFace в production
+    return target
+
+# ===================== AR ENGINE =====================
+
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=True)
+
+
+def get_keypoints(image: np.ndarray) -> dict | None:
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+
+    if not results.pose_landmarks:
+        return None
+
+    h, w, _ = image.shape
+    lm = results.pose_landmarks.landmark
+
+    def pt(landmark):
+        return (
+            max(0, min(w - 1, int(lm[landmark].x * w))),
+            max(0, min(h - 1, int(lm[landmark].y * h)))
+        )
+
+    return {
+        "right_wrist": pt(mp_pose.PoseLandmark.RIGHT_WRIST),
+        "left_wrist":  pt(mp_pose.PoseLandmark.LEFT_WRIST),
+        "mouth":       pt(mp_pose.PoseLandmark.MOUTH_LEFT),
+    }
+
+
+def overlay_object(image: np.ndarray, obj_path: str, position: tuple, size: int = 80) -> np.ndarray:
+    if not os.path.exists(obj_path):
+        log.warning(f"Overlay asset not found: {obj_path}")
+        return image
+
+    obj = Image.open(obj_path).convert("RGBA")
+    obj = obj.resize((size, size), Image.LANCZOS)
+
+    img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).convert("RGBA")
+
+    x, y = position
+    # Не выходим за пределы изображения
+    x = max(0, min(x - size // 2, img_pil.width - size))
+    y = max(0, min(y - size // 2, img_pil.height - size))
+
+    img_pil.paste(obj, (x, y), obj)
+
+    return cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def ar_overlay(image: np.ndarray) -> np.ndarray:
+    keypoints = get_keypoints(image)
+    if not keypoints:
+        return None  # сигнал что человек не найден
+
+    result = image.copy()
+
+    if os.path.exists("icecream.png"):
+        result = overlay_object(result, "icecream.png", keypoints["right_wrist"], size=70)
+
+    if os.path.exists("mic.png"):
+        result = overlay_object(result, "mic.png", keypoints["mouth"], size=60)
+
+    return result
+
+# ===================== PLUGINS =====================
+
+class Plugin:
+    async def run(self, ctx: dict) -> dict:
+        raise NotImplementedError
+
+
+class GenPlugin(Plugin):
+    async def run(self, ctx: dict) -> dict:
+        img = await ai_generate(ctx["prompt"])
+        return {"type": "image", "data": img, "caption": "🎨 Готово!"}
+
+
+class EditPlugin(Plugin):
+    async def run(self, ctx: dict) -> dict:
+        img_bytes = base64.b64decode(ctx["image"])
+        result = await ai_edit(img_bytes, ctx["prompt"])
+        return {"type": "image", "data": result, "caption": "✏️ Редактирование готово!"}
+
+
+class ARPlugin(Plugin):
+    async def run(self, ctx: dict) -> dict:
+        image = await run_cpu(decode_b64, ctx["image"])
+        result = await run_cpu(ar_overlay, image)
+
+        if result is None:
+            return {"type": "text", "data": None, "caption": "❌ Человек не найден на фото"}
+
+        img_bytes = await run_cpu(encode_jpg, result)
+        return {"type": "image", "data": img_bytes, "caption": "🍦 AR overlay готов!"}
+
+
+class FaceSwapPlugin(Plugin):
+    async def run(self, ctx: dict) -> dict:
+        src = await run_cpu(decode_b64, ctx["source"])
+        tgt = await run_cpu(decode_b64, ctx["target"])
+        result = await run_cpu(faceswap, src, tgt)
+        img_bytes = await run_cpu(encode_jpg, result)
+        return {"type": "image", "data": img_bytes, "caption": "👤 Face swap готов!"}
+
+
+plugins: dict[str, Plugin] = {
+    "gen":      GenPlugin(),
+    "edit":     EditPlugin(),
+    "ar":       ARPlugin(),
+    "faceswap": FaceSwapPlugin(),
+}
+
+# ===================== ROUTER =====================
+
+def route(text: str) -> str:
+    t = text.lower()
+    if "/gen" in t:       return "gen"
+    if "/edit" in t:      return "edit"
+    if "/swap" in t:      return "faceswap"
+    if "/ar" in t:        return "ar"
+    return "unknown"
+
+# ===================== FILE LOADER =====================
+
+async def load_file(file_id: str) -> bytes:
+    f = await bot.get_file(file_id)
+    d = await bot.download_file(f.file_path)
+    return d.read()
+
+# ===================== HANDLERS =====================
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🤖 <b>AR Bot</b> готов к работе!\n\n"
+        "<b>Команды:</b>\n"
+        "📸 Отправь фото — добавлю AR объекты\n"
+        "/gen &lt;описание&gt; — сгенерировать изображение\n"
+        "/edit &lt;описание&gt; — отредактировать изображение (прикрепи фото)\n"
+        "/swap — поменять лица (пришли 2 фото)\n"
+        "/status &lt;job_id&gt; — статус задания\n"
+        "/help — помощь",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "<b>Как пользоваться:</b>\n\n"
+        "• Просто пришли фото — бот найдёт человека и добавит предметы (мороженое, микрофон)\n"
+        "• <code>/gen закат над горами</code> — сгенерировать картинку по описанию\n"
+        "• Пришли фото + подпись <code>/edit сделай фон космическим</code> — редактировать\n"
+        "• <code>/status job_id</code> — узнать статус задания\n\n"
+        f"Лимит: {RATE_LIMIT_MAX} запросов в минуту.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажи job_id: /status &lt;job_id&gt;", parse_mode="HTML")
+        return
+
+    job = get_job(parts[1].strip())
+    if not job:
+        await message.answer("❌ Задание не найдено (или истёк срок хранения)")
+        return
+
+    status_map = {
+        "pending": "⏳ В очереди",
+        "running": "⚙️ Выполняется",
+        "done":    "✅ Готово",
+        "error":   "❌ Ошибка",
+    }
+    status_text = status_map.get(job["status"], job["status"])
+    error_info = f"\n<code>{job.get('error', '')}</code>" if job["status"] == "error" else ""
+
+    await message.answer(
+        f"Задание <code>{job['id'][:8]}…</code>\n"
+        f"Статус: {status_text}{error_info}",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+
+    if not check_rate_limit(user_id):
+        await message.answer(f"⏱ Слишком много запросов. Подожди немного.")
+        return
+
+    raw = await load_file(message.photo[-1].file_id)
+    b64 = base64.b64encode(raw).decode()
+
+    caption = message.caption or ""
+
+    if "/edit" in caption.lower():
+        prompt = caption.lower().replace("/edit", "").strip()
+        if not prompt:
+            await message.answer("Укажи что изменить: /edit &lt;описание&gt;", parse_mode="HTML")
+            return
+        job_id = create_job("edit", user_id, {"image": b64, "prompt": prompt})
+        await message.answer(f"✏️ Редактирование в очереди\n<code>{job_id}</code>", parse_mode="HTML")
+
+    elif "/swap" in caption.lower():
+        await message.answer("👤 Пришли второе фото с подписью /swap2")
+
+    else:
+        job_id = create_job("ar", user_id, {"image": b64})
+        await message.answer(f"⚙️ AR обработка в очереди\n<code>{job_id}</code>", parse_mode="HTML")
+
+
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    user_id = message.from_user.id
+
+    if not check_rate_limit(user_id):
+        await message.answer("⏱ Слишком много запросов. Подожди немного.")
+        return
+
+    intent = route(message.text)
+
+    if intent == "gen":
+        prompt = message.text.split(maxsplit=1)[1].strip() if len(message.text.split()) > 1 else ""
+        if not prompt:
+            await message.answer("Укажи описание: /gen &lt;текст&gt;", parse_mode="HTML")
+            return
+        job_id = create_job("gen", user_id, {"prompt": prompt})
+        await message.answer(f"🎨 Генерация в очереди\n<code>{job_id}</code>", parse_mode="HTML")
+
+    elif intent == "edit":
+        await message.answer("📸 Пришли фото с подписью /edit &lt;описание&gt;", parse_mode="HTML")
+
+    elif intent == "faceswap":
+        await message.answer("👤 Пришли фото с подписью /swap")
+
+    else:
+        await message.answer(
+            "Не понял команду. Напиши /help для помощи."
+        )
+
+# ===================== WORKER =====================
+
+async def worker(worker_id: int):
+    log.info(f"Worker #{worker_id} started")
+    while True:
+        job_raw = rdb.rpop("jobs")
+        if not job_raw:
+            await asyncio.sleep(0.2)
+            continue
+
+        job = json.loads(job_raw)
+        data = json.loads(job["data"])
+
+        if job.get("retries", 0) >= MAX_RETRIES:
+            job["status"] = "error"
+            job["error"] = "Превышено максимальное количество попыток"
+            update_job(job)
+            log.warning(f"Job {job['id']} exceeded max retries")
+            continue
+
+        log.info(f"Worker #{worker_id} processing job {job['id']} type={job['type']}")
+
+        try:
+            job["status"] = "running"
+            update_job(job)
+
+            plugin = plugins.get(job["type"])
+            if not plugin:
+                raise ValueError(f"Unknown plugin: {job['type']}")
+
+            result = await plugin.run(data)
+
+            job["status"] = "done"
+            job["result_caption"] = result.get("caption", "")
+            if result["type"] == "image" and result["data"]:
+                job["result"] = base64.b64encode(result["data"]).decode()
+            else:
+                job["result"] = None
+
+            update_job(job)
+            log.info(f"Job {job['id']} done")
+
+        except Exception as e:
+            log.exception(f"Job {job['id']} failed: {e}")
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["retries"] = job.get("retries", 0) + 1
+            update_job(job)
+
+            # Вернуть в очередь если есть ещё попытки
+            if job["retries"] < MAX_RETRIES:
+                rdb.lpush("jobs", json.dumps(job))
+
+# ===================== RESULT NOTIFIER =====================
+
+async def job_poller():
+    """Проверяет завершённые задания и отправляет результат пользователю."""
+    log.info("Result notifier started")
+
+    notified_key = "jobs:notified_set"
+
+    while True:
+        await asyncio.sleep(1)
+
+        # Сканируем ключи завершённых заданий
+        cursor = 0
+        while True:
+            cursor, keys = rdb.scan(cursor, match="job:*", count=100)
+            for key in keys:
+                raw = rdb.get(key)
+                if not raw:
+                    continue
+
+                job = json.loads(raw)
+
+                if job["status"] not in ("done", "error"):
+                    continue
+
+                job_id = job["id"]
+
+                # Уже уведомляли?
+                if rdb.sismember(notified_key, job_id):
+                    continue
+
+                rdb.sadd(notified_key, job_id)
+                rdb.expire(notified_key, JOB_TTL)
+
+                chat_id = job.get("chat_id")
+                if not chat_id:
+                    continue
+
+                try:
+                    if job["status"] == "error":
+                        await bot.send_message(
+                            chat_id,
+                            f"❌ Задание завершилось с ошибкой:\n<code>{job.get('error', '?')}</code>",
+                            parse_mode="HTML"
+                        )
+
+                    elif job["status"] == "done":
+                        caption = job.get("result_caption", "✅ Готово!")
+                        result_b64 = job.get("result")
+
+                        if result_b64:
+                            img_bytes = base64.b64decode(result_b64)
+                            await bot.send_photo(
+                                chat_id,
+                                photo=types.BufferedInputFile(img_bytes, filename="result.jpg"),
+                                caption=caption
+                            )
+                        else:
+                            await bot.send_message(chat_id, caption)
+
+                except Exception as e:
+                    log.error(f"Failed to notify user {chat_id} for job {job_id}: {e}")
+
+            if cursor == 0:
+                break
+
+# ===================== STARTUP =====================
+
+async def start_workers():
+    for i in range(NUM_WORKERS):
+        asyncio.create_task(worker(i))
+
+# ===================== MAIN =====================
+
+async def main():
+    log.info("Bot starting...")
+
+    try:
+        rdb.ping()
+        log.info("Redis connected")
+    except redis.ConnectionError:
+        log.error("Redis unavailable! Make sure Redis is running.")
+        return
+
+    await start_workers()
+    asyncio.create_task(job_poller())
+
+    log.info("Polling started")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
